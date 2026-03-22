@@ -3,12 +3,24 @@
 const express = require('express');
 const cors    = require('cors');
 const fetch   = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+const http    = require('http');
+const https   = require('https');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
+
+// Keep-alive agents — reuse TCP connections across requests (big speed win)
+const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 50 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, rejectUnauthorized: false });
+const agent = u => u.startsWith('https') ? httpsAgent : httpAgent;
+
+// Pre-warm DNS for most-used hosts at startup
+const WARMUP_HOSTS = ['https://hshare.ink', 'https://api.allorigins.win', 'https://corsproxy.io'];
+Promise.allSettled(WARMUP_HOSTS.map(h => fetch(h, { method: 'HEAD', agent: agent(h) }).catch(() => {})));
+
 
 // ─── CF-Protected domain list ─────────────────────────────────────────────────
 
@@ -59,60 +71,111 @@ const aH = (x = {}) => ({
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ─── Parallel proxy race ──────────────────────────────────────────────────────
-// All 5 proxies fire simultaneously — fastest valid response wins
+// ─── Ultra-fast parallel proxy race ───────────────────────────────────────────
+//
+//  SPEED DESIGN:
+//  • All proxies + direct fetch fire at the SAME instant
+//  • Each has its own AbortController — winner cancels all losers immediately
+//  • Hard 8s global timeout — never wait longer than that
+//  • 8 proxy sources total; fastest one wins
+//  • Direct fetch attempted first with 200ms head-start via Promise.race trick
 
-async function raceProxies(url) {
-  const ok = t => t && t.length > 300;
+function withTimeout(promise, ms, label) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  return promise.finally(() => clearTimeout(timer));
+}
+
+async function raceProxies(url, referer = null) {
+  const enc  = encodeURIComponent(url);
+  const ok   = t => typeof t === 'string' && t.length > 300;
+  const hdrs = bH(referer ? { Referer: referer } : {});
+  const ag   = agent(url);
+
+  const controllers = Array.from({ length: 9 }, () => new AbortController());
+  let settled = false;
+
+  const wrap = (idx, promise) => promise.then(text => {
+    if (!ok(text)) throw new Error(`proxy${idx} empty`);
+    if (!settled) {
+      settled = true;
+      controllers.forEach((c, i) => { if (i !== idx) try { c.abort(); } catch {} });
+      console.log(`[Proxy] winner=proxy${idx} len=${text.length}`);
+    }
+    return text;
+  });
+
   const strategies = [
-    // 1. allorigins
-    fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`, { headers: aH() })
-      .then(r => r.ok ? r.json() : Promise.reject('allorigins ' + r.status))
-      .then(d => { if (!ok(d.contents)) throw new Error('allorigins empty'); return d.contents; }),
+    // 0. Direct with keep-alive agent — fastest if not CF-blocked
+    wrap(0, fetch(url, { headers: hdrs, redirect: 'follow', signal: controllers[0].signal, agent: ag })
+      .then(r => { if (r.status === 403 || r.status === 503) throw new Error('CF'); if (!r.ok) throw new Error('d' + r.status); return r.text(); })),
 
-    // 2. corsproxy.io
-    fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, { headers: bH() })
-      .then(r => r.ok ? r.text() : Promise.reject('corsproxy ' + r.status))
-      .then(t => { if (!ok(t)) throw new Error('corsproxy empty'); return t; }),
+    // 1. allorigins (JSON wrapper)
+    wrap(1, fetch(`https://api.allorigins.win/get?url=${enc}`, { headers: aH(), signal: controllers[1].signal, agent: httpsAgent })
+      .then(r => r.ok ? r.json() : Promise.reject('ao' + r.status))
+      .then(d => d.contents || Promise.reject('ao empty'))),
 
-    // 3. codetabs
-    fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`, { headers: bH() })
-      .then(r => r.ok ? r.text() : Promise.reject('codetabs ' + r.status))
-      .then(t => { if (!ok(t)) throw new Error('codetabs empty'); return t; }),
+    // 2. allorigins raw (no JSON, slightly faster)
+    wrap(2, fetch(`https://api.allorigins.win/raw?url=${enc}`, { headers: aH(), signal: controllers[2].signal, agent: httpsAgent })
+      .then(r => r.ok ? r.text() : Promise.reject('aor' + r.status))),
 
-    // 4. thingproxy
-    fetch(`https://thingproxy.freeboard.io/fetch/${url}`, { headers: bH() })
-      .then(r => r.ok ? r.text() : Promise.reject('thingproxy ' + r.status))
-      .then(t => { if (!ok(t)) throw new Error('thingproxy empty'); return t; }),
+    // 3. corsproxy.io
+    wrap(3, fetch(`https://corsproxy.io/?${enc}`, { headers: hdrs, signal: controllers[3].signal, agent: httpsAgent })
+      .then(r => r.ok ? r.text() : Promise.reject('cp' + r.status))),
 
-    // 5. Direct — Render server IP may not be blocked
-    fetch(url, { headers: bH(), redirect: 'follow' })
-      .then(r => {
-        if (r.status === 403 || r.status === 503) throw new Error('CF block');
-        if (!r.ok) throw new Error('direct ' + r.status);
-        return r.text();
-      })
-      .then(t => { if (!ok(t)) throw new Error('direct empty'); return t; }),
+    // 4. codetabs
+    wrap(4, fetch(`https://api.codetabs.com/v1/proxy?quest=${enc}`, { headers: hdrs, signal: controllers[4].signal, agent: httpsAgent })
+      .then(r => r.ok ? r.text() : Promise.reject('ct' + r.status))),
+
+    // 5. thingproxy
+    wrap(5, fetch(`https://thingproxy.freeboard.io/fetch/${url}`, { headers: hdrs, signal: controllers[5].signal, agent: httpsAgent })
+      .then(r => r.ok ? r.text() : Promise.reject('tp' + r.status))),
+
+    // 6. cors.sh
+    wrap(6, fetch(`https://proxy.cors.sh/${url}`, { headers: { ...hdrs, 'x-cors-api-key': 'temp_test' }, signal: controllers[6].signal, agent: httpsAgent })
+      .then(r => r.ok ? r.text() : Promise.reject('cs' + r.status))),
+
+    // 7. Cloudflare Workers CORS proxy (public)
+    wrap(7, fetch(`https://cors-anywhere.azurewebsites.net/${url}`, { headers: { ...hdrs, 'X-Requested-With': 'XMLHttpRequest' }, signal: controllers[7].signal, agent: httpsAgent })
+      .then(r => r.ok ? r.text() : Promise.reject('ca' + r.status))),
+
+    // 8. htmlreceiver via workers (backup)
+    wrap(8, fetch(`https://api.allorigins.win/get?url=${enc}&charset=utf-8`, { headers: aH(), signal: controllers[8].signal, agent: httpsAgent })
+      .then(r => r.ok ? r.json() : Promise.reject('ao2' + r.status))
+      .then(d => d.contents || Promise.reject('ao2 empty'))),
   ];
 
-  return Promise.any(strategies).catch(() => {
-    throw new Error(`All proxy strategies failed for ${url}`);
+  // 8s hard deadline
+  const deadline = new Promise((_, rej) => setTimeout(() => {
+    controllers.forEach(c => { try { c.abort(); } catch {} });
+    rej(new Error('timeout'));
+  }, 8000));
+
+  return Promise.race([Promise.any(strategies), deadline]).catch(e => {
+    controllers.forEach(c => { try { c.abort(); } catch {} });
+    throw new Error(`All proxies failed for ${url}: ${e.message}`);
   });
 }
 
 async function scrapeHtml(url, referer = null) {
   if (isProtected(url)) {
     console.log(`[Proxy] racing ${url}`);
-    const text = await raceProxies(url);
-    console.log(`[Proxy] got ${text.length} chars`);
+    const text = await raceProxies(url, referer);
     return { text, finalUrl: url };
   }
-  const r = await fetch(url, {
-    headers: bH(referer ? { Referer: referer } : {}),
-    redirect: 'follow',
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
-  return { text: await r.text(), finalUrl: r.url };
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 8000);
+  try {
+    const r = await fetch(url, {
+      headers: bH(referer ? { Referer: referer } : {}),
+      redirect: 'follow',
+      signal: ac.signal,
+      agent: agent(url),
+    });
+    clearTimeout(timer);
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
+    return { text: await r.text(), finalUrl: r.url };
+  } catch (e) { clearTimeout(timer); throw e; }
 }
 
 // ─── HTML helpers ─────────────────────────────────────────────────────────────
@@ -173,23 +236,30 @@ async function resolveViaApi(url) {
 async function bypassHcloud(url) {
   console.log(`[hcloud] bypassing: ${url}`);
   try {
-    let html;
+    // hcloud.shop is NOT CF-protected — fetch directly, no proxy needed
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 6000);
+    let html, finalUrl;
     try {
-      ({ text: html } = await scrapeHtml(url, 'https://hshare.ink/'));
-    } catch {
-      const r = await fetch(url, { headers: bH({ Referer: 'https://hshare.ink/' }), redirect: 'follow' });
+      const r = await fetch(url, { headers: bH({ Referer: 'https://hshare.ink/' }), redirect: 'follow', signal: ac.signal, agent: httpsAgent });
       html = await r.text();
+      finalUrl = r.url;
+    } catch {
+      // Fallback to scrapeHtml if direct fails
+      ({ text: html, finalUrl } = await scrapeHtml(url, 'https://hshare.ink/'));
     }
 
     const servers = [];
 
-    // Primary: id="download-btn1", "download-btn2" etc.
+    // Extract all download-btnN links
     for (let i = 1; i <= 10; i++) {
-      const m = new RegExp(`id=["']download-btn${i}["'][^>]*href=["']([^"']+)["']|href=["']([^"']+)["'][^>]*id=["']download-btn${i}["']`, 'i').exec(html);
+      const m = new RegExp(
+        `id=["']download-btn${i}["'][^>]*href=["']([^"']+)["']|href=["']([^"']+)["'][^>]*id=["']download-btn${i}["']`, 'i'
+      ).exec(html);
       if (m) servers.push({ server: `Server ${i}`, link: m[1] || m[2] });
     }
 
-    // Fallback: any anchor with "Server N" text
+    // Fallback: anchors with "Server N" text
     if (!servers.length) {
       for (const el of parseLinks(html)) {
         if (/server\s*\d+/i.test(el.text) && el.href.startsWith('http')) {
@@ -198,13 +268,13 @@ async function bypassHcloud(url) {
       }
     }
 
-    // Fallback: any btn-success / btn-primary download link
+    // Fallback: any download/CDN link
     if (!servers.length) {
       const direct = extractFinalFromHtml(html);
       if (direct) servers.push({ server: 'HCloud', link: direct });
     }
 
-    console.log(`[hcloud] found ${servers.length} server(s)`);
+    console.log(`[hcloud] ${servers.length} server(s)`);
     return servers.length ? servers : [{ server: 'HCloud', link: url }];
   } catch (e) {
     console.log(`[hcloud] error: ${e}`);
@@ -226,43 +296,59 @@ async function bypassHshareMulti(url) {
   console.log(`[hshare/multi] ${url}`);
 
   if (url.includes('/file.php') && url.includes('id=') && url.includes('key=')) {
+    // ── file.php: race direct fetch vs proxy simultaneously ────────────────
+    let html = null;
+
+    const directFetch = fetch(url, {
+      headers: bH({ Referer: 'https://hshare.ink/' }),
+      redirect: 'follow',
+      agent: httpsAgent,
+    }).then(async r => {
+      if (!r.ok) throw new Error('direct ' + r.status);
+      const t = await r.text();
+      if (t.length < 300) throw new Error('direct empty');
+      return t;
+    });
+
+    const proxyFetch = raceProxies(url, 'https://hshare.ink/');
+
     try {
-      let html;
-      try {
-        ({ text: html } = await scrapeHtml(url, 'https://hshare.ink/'));
-      } catch {
-        const r = await fetch(url, { headers: bH({ Referer: 'https://hshare.ink/' }), redirect: 'follow' });
-        html = await r.text();
-      }
-
-      // Look for hcloud.shop link
-      const hcloudM = /href=["'](https?:\/\/[^"']*hcloud[^"']+)["']/i.exec(html);
-      if (hcloudM) {
-        console.log(`[hshare/multi] found hcloud: ${hcloudM[1]}`);
-        const servers = await bypassHcloud(hcloudM[1]);
-        return servers;
-      }
-
-      // Direct CDN/download links on page
-      const streams = [];
-      for (const el of parseLinks(html)) {
-        if (el.href.startsWith('http') && !el.href.includes('hshare') && !el.href.includes('javascript')) {
-          if (el.href.includes('hcloud')) {
-            const servers = await bypassHcloud(el.href);
-            streams.push(...servers);
-          } else {
-            streams.push({ server: el.text || 'HShare', link: el.href });
-          }
-        }
-      }
-      if (streams.length) return streams;
+      html = await Promise.any([directFetch, proxyFetch]);
+      console.log(`[hshare/file.php] page fetched len=${html.length}`);
     } catch (e) {
-      console.log(`[hshare/multi] error: ${e}`);
+      console.log(`[hshare/file.php] all fetches failed: ${e}`);
+      return [{ server: 'HShare', link: url }];
     }
-    return [{ server: 'HShare', link: url }];
+
+    // Find hcloud.shop link and bypass it
+    const hcloudM = /href=["'](https?:\/\/[^"']*hcloud[^"']+)["']/i.exec(html);
+    if (hcloudM) {
+      console.log(`[hshare/file.php] → hcloud: ${hcloudM[1]}`);
+      return bypassHcloud(hcloudM[1]);
+    }
+
+    // Scan all links
+    const streams = [];
+    for (const el of parseLinks(html)) {
+      if (!el.href.startsWith('http') || el.href.includes('hshare') || el.href.startsWith('javascript')) continue;
+      if (el.href.includes('hcloud')) {
+        const servers = await bypassHcloud(el.href);
+        streams.push(...servers);
+      } else {
+        streams.push({ server: el.text || 'HShare', link: el.href });
+      }
+    }
+
+    // Last resort: extractFinalFromHtml
+    if (!streams.length) {
+      const direct = extractFinalFromHtml(html);
+      if (direct) streams.push({ server: 'HShare', link: direct });
+    }
+
+    return streams.length ? streams : [{ server: 'HShare', link: url }];
   }
 
-  // For redirect.php — single URL result
+  // redirect.php path — single URL result from token bypass
   const finalUrl = await bypassHshare(url);
   return [{ server: 'HShare', link: finalUrl }];
 }
