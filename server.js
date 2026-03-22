@@ -29,7 +29,7 @@ const CF_PROTECTED = [
   'hubcloud.bar','hubcloud.media','hubcloud.lol','hubcloud.cam','hubcloud.skin',
   'hubcloud.hair','hubcloud.vip','hubcloud.luxury','hubcloud.top',
   'gdflix.dev','gdflix.sbs','gdflix.xyz','gdflix.lol','gdflix.top',
-  'hshare.ink',
+  'hshare.ink','hcloud.shop',
 ];
 
 function isProtected(url) {
@@ -387,12 +387,13 @@ async function bypassHshareMulti(url) {
 async function bypassHcloud(url) {
   console.log(`[hcloud] ${url}`);
   try {
-    // redirect.php?url=BASE64 → decode one level → get direct/index.php page → fetch it
+    // Step 1: decode redirect.php?url=B64 → direct/index.php?url=B64 (one level)
+    let pageUrl = url;
     if (url.includes('hcloud.shop') && url.includes('url=')) {
-      const pageUrl = decodeHcloudChain(url);
-      if (pageUrl) return fetchHcloudPage(pageUrl);
+      const decoded = decodeHcloudChain(url);
+      if (decoded) pageUrl = decoded;
     }
-    return fetchHcloudPage(url);
+    return fetchHcloudPage(pageUrl);
   } catch (e) {
     console.log(`[hcloud] error: ${e}`);
     return [{ server: 'HCloud', link: url }];
@@ -400,40 +401,63 @@ async function bypassHcloud(url) {
 }
 
 async function fetchHcloudPage(url) {
-  console.log(`[hcloud/page] fetching: ${url.slice(0, 100)}`);
-
-  // Race direct fetch vs proxy — hcloud.shop is usually not CF-blocked
-  let html = '';
-  try {
-    const ac = new AbortController();
-    setTimeout(() => ac.abort(), 6000);
-    const r = await fetch(url, {
-      headers: bH({ Referer: 'https://hshare.ink/' }),
-      redirect: 'follow',
-      signal: ac.signal,
-      agent: httpsAgent,
-    });
-    html = await r.text();
-    console.log(`[hcloud/page] direct OK len=${html.length}`);
-  } catch (e) {
-    console.log(`[hcloud/page] direct failed: ${e} — trying proxy`);
-    try {
-      ({ text: html } = await scrapeHtml(url, 'https://hshare.ink/'));
-    } catch {
-      return [{ server: 'HCloud', link: url }];
-    }
-  }
+  console.log(`[hcloud/page] ${url.slice(0, 100)}`);
 
   const servers = [];
   const seen = new Set();
-
   const add = (server, link) => {
     if (!link || !link.startsWith('http') || seen.has(link)) return;
     seen.add(link);
     servers.push({ server, link });
   };
 
-  // ── Pattern 1: id="download-btn1" ... id="download-btn10" ────────────────
+  // ── Instant decode: extract the CDN URL directly from url= param ──────────
+  // hcloud.shop/direct/index.php?url=BASE64 — the base64 IS the final CDN URL
+  // This gives us at least 1 result with zero network requests
+  try {
+    const u = new URL(url);
+    const urlParam = u.searchParams.get('url');
+    if (urlParam) {
+      const decoded = Buffer.from(urlParam, 'base64').toString('utf8');
+      if (decoded.startsWith('http') && !decoded.includes('hcloud.shop')) {
+        console.log(`[hcloud/page] instant decode: ${decoded.slice(0, 80)}`);
+        add('Server 1', decoded);
+      }
+    }
+  } catch {}
+
+  // ── Parallel: fetch the page to get ALL server buttons ────────────────────
+  // Fire direct fetch + proxy race at the same time
+  const fetchPage = async () => {
+    const directFetch = fetch(url, {
+      headers: bH({ Referer: 'https://hshare.ink/' }),
+      redirect: 'follow',
+      agent: httpsAgent,
+    }).then(async r => {
+      if (!r.ok) throw new Error('direct ' + r.status);
+      const t = await r.text();
+      if (t.length < 200) throw new Error('too short');
+      return t;
+    });
+
+    const proxyFetch = raceProxies(url, 'https://hshare.ink/');
+
+    return Promise.any([directFetch, proxyFetch]);
+  };
+
+  let html = '';
+  try {
+    html = await fetchPage();
+    console.log(`[hcloud/page] fetched len=${html.length}`);
+  } catch (e) {
+    console.log(`[hcloud/page] fetch failed: ${e}`);
+    // Return instant decode result if we have it
+    return servers.length ? servers : [{ server: 'HCloud', link: url }];
+  }
+
+  // ── Extract all server links from the fetched page ────────────────────────
+
+  // Pattern 1: id="download-btn1" ... id="download-btn10"
   for (let i = 1; i <= 10; i++) {
     const m = new RegExp(
       `id=["']download-btn${i}["'][^>]*href=["']([^"']+)["']|href=["']([^"']+)["'][^>]*id=["']download-btn${i}["']`, 'i'
@@ -441,37 +465,46 @@ async function fetchHcloudPage(url) {
     if (m) add(`Server ${i}`, (m[1] || m[2]).trim());
   }
 
-  // ── Pattern 2: All <a> buttons with server-like text ─────────────────────
+  // Pattern 2: <a> with "Server N" / "Download" text
   for (const el of parseLinks(html)) {
-    if (!el.href.startsWith('http')) continue;
+    if (!el.href.startsWith('http') || el.href.includes('hcloud.shop')) continue;
     const txt = el.text.trim();
-    if (/server\s*\d*/i.test(txt) || /download/i.test(txt) || /link\s*\d*/i.test(txt)) {
-      add(txt || `Server`, el.href);
+    if (/server\s*\d*/i.test(txt) || /download/i.test(txt)) {
+      add(txt || 'Server', el.href);
     }
   }
 
-  // ── Pattern 3: data-url or data-href attributes ───────────────────────────
-  const dataRe = /data-(?:url|href|src)=["'](https?:\/\/[^"']+)["']/gi;
-  let dm;
-  while ((dm = dataRe.exec(html)) !== null) add('HCloud', dm[1]);
-
-  // ── Pattern 4: workers.dev / r2.dev / CDN links in JS ────────────────────
+  // Pattern 3: any workers.dev / CDN URL in the page HTML
   const cdnRe = /(https?:\/\/[^\s"'<>\\]+\.(?:workers\.dev|r2\.dev|cloudfront\.net|b-cdn\.net|bunnycdn\.com)[^\s"'<>\\]*)/g;
   let cm;
-  while ((cm = cdnRe.exec(html)) !== null) add('HCloud CDN', cm[1].split('\\')[0]);
+  while ((cm = cdnRe.exec(html)) !== null) {
+    add('CDN Server', cm[1].split('\\')[0].split('"')[0]);
+  }
 
-  // ── Pattern 5: btn-success / btn-primary / btn-warning buttons ────────────
-  if (!servers.length) {
+  // Pattern 4: decode every url= param found in page (server mirrors)
+  const urlParamRe = /[?&]url=([A-Za-z0-9+/=]{20,})/g;
+  let pm;
+  while ((pm = urlParamRe.exec(html)) !== null) {
+    try {
+      const dec = Buffer.from(pm[1], 'base64').toString('utf8');
+      if (dec.startsWith('http') && !dec.includes('hcloud.shop')) {
+        add(`Mirror ${servers.length + 1}`, dec);
+      }
+    } catch {}
+  }
+
+  // Pattern 5: btn-success / btn-primary / btn-warning / btn-info anchors
+  if (servers.length <= 1) {
     for (const el of parseLinks(html)) {
-      if (!el.href.startsWith('http')) continue;
+      if (!el.href.startsWith('http') || el.href.includes('hcloud.shop')) continue;
       if (el.classes.includes('btn-success') || el.classes.includes('btn-primary') ||
           el.classes.includes('btn-warning') || el.classes.includes('btn-info')) {
-        add(el.text.trim() || 'HCloud', el.href);
+        add(el.text.trim() || 'Server', el.href);
       }
     }
   }
 
-  console.log(`[hcloud/page] ${servers.length} server(s) found`);
+  console.log(`[hcloud/page] ${servers.length} server(s)`);
   return servers.length ? servers : [{ server: 'HCloud', link: url }];
 }
 
