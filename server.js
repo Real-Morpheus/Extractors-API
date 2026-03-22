@@ -164,19 +164,108 @@ async function resolveViaApi(url) {
   } catch { return null; }
 }
 
+// ─── hcloud.shop Bypasser ─────────────────────────────────────────────────────
+//
+//  hcloud pages list multiple download servers (Server 1, Server 2, etc.)
+//  as <a id="download-btn1">, <a id="download-btn2"> etc.
+//  We fetch the page, extract all server links, and return them all.
+
+async function bypassHcloud(url) {
+  console.log(`[hcloud] bypassing: ${url}`);
+  try {
+    let html;
+    try {
+      ({ text: html } = await scrapeHtml(url, 'https://hshare.ink/'));
+    } catch {
+      const r = await fetch(url, { headers: bH({ Referer: 'https://hshare.ink/' }), redirect: 'follow' });
+      html = await r.text();
+    }
+
+    const servers = [];
+
+    // Primary: id="download-btn1", "download-btn2" etc.
+    for (let i = 1; i <= 10; i++) {
+      const m = new RegExp(`id=["']download-btn${i}["'][^>]*href=["']([^"']+)["']|href=["']([^"']+)["'][^>]*id=["']download-btn${i}["']`, 'i').exec(html);
+      if (m) servers.push({ server: `Server ${i}`, link: m[1] || m[2] });
+    }
+
+    // Fallback: any anchor with "Server N" text
+    if (!servers.length) {
+      for (const el of parseLinks(html)) {
+        if (/server\s*\d+/i.test(el.text) && el.href.startsWith('http')) {
+          servers.push({ server: el.text.trim(), link: el.href });
+        }
+      }
+    }
+
+    // Fallback: any btn-success / btn-primary download link
+    if (!servers.length) {
+      const direct = extractFinalFromHtml(html);
+      if (direct) servers.push({ server: 'HCloud', link: direct });
+    }
+
+    console.log(`[hcloud] found ${servers.length} server(s)`);
+    return servers.length ? servers : [{ server: 'HCloud', link: url }];
+  } catch (e) {
+    console.log(`[hcloud] error: ${e}`);
+    return [{ server: 'HCloud', link: url }];
+  }
+}
+
 // ─── hshare.ink Bypasser ──────────────────────────────────────────────────────
 //
-//  hshare pages work like this:
-//    1. Page loads with a hidden token + JS countdown (usually 5-10s)
-//    2. After countdown, POST the token to the form action
-//    3. Response contains the final CDN/Drive URL in var reurl = "..."
+//  Two URL patterns:
 //
-//  We race 5 strategies in parallel:
-//    - Token POST (with countdown wait)
-//    - JS window.location already in page
-//    - Meta refresh URL
-//    - reurl variable already in page
-//    - Direct download anchor on page
+//  1. /redirect.php?id=...   — countdown page → token POST → final CDN URL
+//  2. /file.php?id=...&key=... — direct file page → hcloud.shop → server list
+//
+//  bypassHshare() always returns a STRING (single final URL).
+//  bypassHshareMulti() returns ARRAY of {server, link} for file.php pages.
+
+async function bypassHshareMulti(url) {
+  console.log(`[hshare/multi] ${url}`);
+
+  if (url.includes('/file.php') && url.includes('id=') && url.includes('key=')) {
+    try {
+      let html;
+      try {
+        ({ text: html } = await scrapeHtml(url, 'https://hshare.ink/'));
+      } catch {
+        const r = await fetch(url, { headers: bH({ Referer: 'https://hshare.ink/' }), redirect: 'follow' });
+        html = await r.text();
+      }
+
+      // Look for hcloud.shop link
+      const hcloudM = /href=["'](https?:\/\/[^"']*hcloud[^"']+)["']/i.exec(html);
+      if (hcloudM) {
+        console.log(`[hshare/multi] found hcloud: ${hcloudM[1]}`);
+        const servers = await bypassHcloud(hcloudM[1]);
+        return servers;
+      }
+
+      // Direct CDN/download links on page
+      const streams = [];
+      for (const el of parseLinks(html)) {
+        if (el.href.startsWith('http') && !el.href.includes('hshare') && !el.href.includes('javascript')) {
+          if (el.href.includes('hcloud')) {
+            const servers = await bypassHcloud(el.href);
+            streams.push(...servers);
+          } else {
+            streams.push({ server: el.text || 'HShare', link: el.href });
+          }
+        }
+      }
+      if (streams.length) return streams;
+    } catch (e) {
+      console.log(`[hshare/multi] error: ${e}`);
+    }
+    return [{ server: 'HShare', link: url }];
+  }
+
+  // For redirect.php — single URL result
+  const finalUrl = await bypassHshare(url);
+  return [{ server: 'HShare', link: finalUrl }];
+}
 
 function extractFinalFromHtml(html) {
   // reurl JS variable (most common hshare response format)
@@ -210,6 +299,50 @@ function extractFinalFromHtml(html) {
 
 async function bypassHshare(url) {
   console.log(`[hshare] bypassing: ${url}`);
+
+  // ── hshare.ink/file.php?id=...&key=... — direct file download page ───────
+  // This endpoint shows an hcloud.shop download page with server buttons.
+  // We fetch it, find the hcloud link, then follow it to get server URLs.
+  if (url.includes('/file.php') && url.includes('id=') && url.includes('key=')) {
+    console.log(`[hshare/file.php] detected — fetching download page`);
+    try {
+      let html;
+      try {
+        ({ text: html } = await scrapeHtml(url, 'https://hshare.ink/'));
+      } catch {
+        // Try direct fetch if proxy fails
+        const r = await fetch(url, { headers: bH({ Referer: 'https://hshare.ink/' }), redirect: 'follow' });
+        html = await r.text();
+      }
+
+      // Look for hcloud.shop link or any direct CDN link
+      const hcloudM = /href=["'](https?:\/\/[^"']*hcloud[^"']+)["']/i.exec(html);
+      if (hcloudM) {
+        console.log(`[hshare/file.php] found hcloud: ${hcloudM[1]}`);
+        return bypassHcloud(hcloudM[1]);
+      }
+
+      // Look for direct download button / CDN link on the page
+      const direct = extractFinalFromHtml(html);
+      if (direct && !direct.includes('hshare')) {
+        console.log(`[hshare/file.php] direct link: ${direct}`);
+        return direct;
+      }
+
+      // Try following any button link on the page
+      for (const el of parseLinks(html)) {
+        if (el.href.startsWith('http') && !el.href.includes('hshare') && !el.href.includes('javascript')) {
+          console.log(`[hshare/file.php] fallback link: ${el.href}`);
+          // If it looks like an hcloud page, bypass it
+          if (el.href.includes('hcloud')) return bypassHcloud(el.href);
+          return el.href;
+        }
+      }
+    } catch (e) {
+      console.log(`[hshare/file.php] error: ${e}`);
+    }
+    return url;
+  }
 
   let html;
   try {
@@ -333,7 +466,7 @@ async function vcloudExtract(url) {
       let lnk = el.href;
       if (!lnk || lnk.startsWith('#') || lnk.startsWith('javascript')) continue;
       if (excl.some(p => lnk.includes(p))) continue;
-      if (lnk.includes('hshare.ink'))    { futs.push(bypassHshare(lnk).then(f => streams.push({ server: 'HShare', link: f, type: 'mkv' }))); continue; }
+      if (lnk.includes('hshare.ink'))    { futs.push(bypassHshareMulti(lnk).then(ss => ss.forEach(s => streams.push({ ...s, type: 'mkv' })))); continue; }
       if (lnk.includes('pixeld'))         { streams.push({ server: 'Pixeldrain', link: normPixel(lnk), type: 'mkv' }); continue; }
       if (lnk.includes('pixel.hubcdn.fans')) { futs.push(resolveViaApi(lnk).then(f => { if (f) streams.push({ server: 'DRIVE (NON-RESUME)', link: f, type: 'mkv' }); })); continue; }
       if (lnk.includes('gpdl2.hubcdn.fans') || lnk.includes('gpdl.hubcdn.fans')) { futs.push(resolveViaApi(lnk).then(f => streams.push({ server: 'HubCdn (DRIVE-ONLY)', link: f || lnk, type: 'mkv' }))); continue; }
@@ -422,7 +555,7 @@ async function processHubButtons(html, pageUrl) {
     if (!lnk || lnk.startsWith('#') || lnk.startsWith('javascript')) continue;
     if (!lnk.startsWith('http')) { try { lnk = new URL(lnk, pageUrl).href; } catch { continue; } }
 
-    if (lnk.includes('hshare.ink'))     { futs.push(bypassHshare(lnk).then(f => streams.push({ server: 'HShare', link: f, type: 'mkv' }))); continue; }
+    if (lnk.includes('hshare.ink'))     { futs.push(bypassHshareMulti(lnk).then(ss => ss.forEach(s => streams.push({ ...s, type: 'mkv' })))); continue; }
     if (lnk.includes('gdflix'))          { streams.push({ server: 'GDFlix', link: lnk, type: 'mkv' }); continue; }
     if (lnk.includes('pixeld'))          { streams.push({ server: 'Pixeldrain', link: normPixel(lnk), type: 'mkv' }); continue; }
     if (lnk.includes('gpdl2.hubcdn.fans') || lnk.includes('gpdl.hubcdn.fans')) { futs.push(resolveViaApi(lnk).then(f => streams.push({ server: 'HubCdn (DRIVE-ONLY)', link: f || lnk, type: 'mkv' }))); continue; }
@@ -459,7 +592,7 @@ async function hubGamerxyt(link, refOrigin) {
     if (!h?.startsWith('http')) continue;
     if (h.includes('telegram') || h.includes('bloggingvector') || h.includes('ampproject.org')) continue;
 
-    if (h.includes('hshare.ink'))    { futs.push(bypassHshare(h).then(f => streams.push({ server: 'HShare', link: f, type: 'mkv' }))); continue; }
+    if (h.includes('hshare.ink'))    { futs.push(bypassHshareMulti(h).then(ss => ss.forEach(s => streams.push({ ...s, type: 'mkv' })))); continue; }
     if (t.includes('FSL Server') || t.includes('FSLv2 Server') || h.includes('.r2.dev') || h.includes('fsl.cdnbaba') || h.includes('cdn.fsl-buckets')) { streams.push({ server: 'Cf Worker', link: h, type: 'mkv' }); continue; }
     if (h.includes('gpdl2.hubcdn.fans') || h.includes('gpdl.hubcdn.fans')) { futs.push(resolveViaApi(h).then(f => streams.push({ server: 'HubCdn (DRIVE-ONLY)', link: f || h, type: 'mkv' }))); continue; }
     if (h.includes('pixel.hubcdn.fans')) { futs.push(resolveViaApi(h).then(f => { if (f) streams.push({ server: 'DRIVE (NON-RESUME)', link: f, type: 'mkv' }); })); continue; }
@@ -564,7 +697,7 @@ async function gdflixExtract(url) {
 
   // hshare links — bypass all in parallel
   for (const el of hshareLinks) {
-    tasks.push(bypassHshare(el.href).then(f => streams.push({ server: 'HShare', link: f, type: 'mkv' })));
+    tasks.push(bypassHshareMulti(el.href).then(ss => ss.forEach(s => streams.push({ ...s, type: 'mkv' }))));
   }
 
   // GoFile (.btn-outline-info)
@@ -680,8 +813,10 @@ async function filepressExtract(url) {
 
 async function autoDetect(url) {
   const l = url.toLowerCase();
-  if (l.includes('hshare.ink'))
-    return { extractor: 'HShare', streams: [{ server: 'HShare', link: await bypassHshare(url), type: 'mkv' }] };
+  if (l.includes('hshare.ink')) {
+    const streams = await bypassHshareMulti(url);
+    return { extractor: 'HShare', streams: streams.map(s => ({ ...s, type: s.type || 'mkv' })) };
+  }
   if (l.includes('vcloud.zip') || l.includes('vcloud.lol'))
     return { extractor: 'VCloud',    streams: await vcloudExtract(url) };
   if (l.includes('gdflix'))
@@ -767,7 +902,7 @@ button{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;bord
   <table>
     <thead><tr><th>Extractor</th><th>Detected by</th><th>Servers</th></tr></thead>
     <tbody>
-      <tr><td><span class="dot" style="background:var(--acc2)"></span>HShare <span class="new"></span></td><td>hshare.ink</td><td>Final CDN/Drive link via token POST bypass</td></tr>
+      <tr><td><span class="dot" style="background:var(--acc2)"></span>HShare <span class="new"></span></td><td>hshare.ink</td><td>redirect.php → token POST bypass · file.php → hcloud server list</td></tr>
       <tr><td><span class="dot"></span>VCloud</td><td>vcloud.zip / vcloud.lol</td><td>10Gbps, R2 CDN, Pixeldrain, HubCdn</td></tr>
       <tr><td><span class="dot"></span>HubCloud</td><td>hubcloud.*</td><td>Cf Worker, Pixeldrain, Mega, ZipDisk, CfStorage, FastDl</td></tr>
       <tr><td><span class="dot"></span>GDFlix</td><td>gdflix.*</td><td>ResumeCloud, ResumeBot, G-Drive, Gdrive-Instant, Pixeldrain, GoFile</td></tr>
@@ -834,7 +969,7 @@ app.get('/extract/:type', async (req, res) => {
   let streams = [];
   try {
     switch (type) {
-      case 'hshare':    streams = [{ server: 'HShare', link: await bypassHshare(target), type: 'mkv' }]; break;
+      case 'hshare':    streams = (await bypassHshareMulti(target)).map(s => ({ ...s, type: s.type || 'mkv' })); break;
       case 'vcloud':    streams = await vcloudExtract(target);    break;
       case 'hubcloud':  streams = await hubcloudExtract(target);  break;
       case 'gdflix':    streams = await gdflixExtract(target);    break;
