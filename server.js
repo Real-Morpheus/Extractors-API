@@ -233,72 +233,122 @@ async function resolveViaApi(url) {
 //  as <a id="download-btn1">, <a id="download-btn2"> etc.
 //  We fetch the page, extract all server links, and return them all.
 
-async function bypassHcloud(url) {
-  console.log(`[hcloud] bypassing: ${url}`);
-  try {
-    // hcloud.shop is NOT CF-protected — fetch directly, no proxy needed
-    const ac = new AbortController();
-    setTimeout(() => ac.abort(), 6000);
-    let html, finalUrl;
-    try {
-      const r = await fetch(url, { headers: bH({ Referer: 'https://hshare.ink/' }), redirect: 'follow', signal: ac.signal, agent: httpsAgent });
-      html = await r.text();
-      finalUrl = r.url;
-    } catch {
-      // Fallback to scrapeHtml if direct fails
-      ({ text: html, finalUrl } = await scrapeHtml(url, 'https://hshare.ink/'));
-    }
-
-    const servers = [];
-
-    // Extract all download-btnN links
-    for (let i = 1; i <= 10; i++) {
-      const m = new RegExp(
-        `id=["']download-btn${i}["'][^>]*href=["']([^"']+)["']|href=["']([^"']+)["'][^>]*id=["']download-btn${i}["']`, 'i'
-      ).exec(html);
-      if (m) servers.push({ server: `Server ${i}`, link: m[1] || m[2] });
-    }
-
-    // Fallback: anchors with "Server N" text
-    if (!servers.length) {
-      for (const el of parseLinks(html)) {
-        if (/server\s*\d+/i.test(el.text) && el.href.startsWith('http')) {
-          servers.push({ server: el.text.trim(), link: el.href });
-        }
-      }
-    }
-
-    // Fallback: any download/CDN link
-    if (!servers.length) {
-      const direct = extractFinalFromHtml(html);
-      if (direct) servers.push({ server: 'HCloud', link: direct });
-    }
-
-    console.log(`[hcloud] ${servers.length} server(s)`);
-    return servers.length ? servers : [{ server: 'HCloud', link: url }];
-  } catch (e) {
-    console.log(`[hcloud] error: ${e}`);
-    return [{ server: 'HCloud', link: url }];
-  }
-}
-
 // ─── hshare.ink Bypasser ──────────────────────────────────────────────────────
 //
 //  Two URL patterns:
 //
-//  1. /redirect.php?id=...   — countdown page → token POST → final CDN URL
-//  2. /file.php?id=...&key=... — direct file page → hcloud.shop → server list
+//  1. /redirect.php?id=...       — countdown page → token POST → final CDN URL
+//  2. /file.php?id=...&key=...   — hcloud URL embedded in id param → decode → servers
 //
-//  bypassHshare() always returns a STRING (single final URL).
-//  bypassHshareMulti() returns ARRAY of {server, link} for file.php pages.
+//  bypassHshare()      returns STRING  (single final URL)
+//  bypassHshareMulti() returns ARRAY   of {server, link}
+
+// ─── Extract embedded hcloud URL from a mangled hshare URL ───────────────────
+//
+//  Some hshare file.php URLs have the hcloud link directly embedded in the
+//  id= param, like:
+//    id=BASE64_FILENAME...https://hcloud.shop/redirect.php?url=BASE64...KEY
+//
+//  We extract it directly — no HTTP request needed. Zero latency.
+
+function extractEmbeddedHcloud(url) {
+  try {
+    // Pattern 1: raw https://hcloud.shop embedded directly in the URL string
+    const rawMatch = /(https?:\/\/hcloud\.shop\/[^\s&"'<>]+)/.exec(url);
+    if (rawMatch) return rawMatch[1];
+
+    // Pattern 2: hcloud URL is inside the id= param (URL-encoded or raw)
+    const idMatch = /[?&]id=([^&]+)/.exec(url);
+    if (!idMatch) return null;
+
+    let idVal = decodeURIComponent(idMatch[1]);
+
+    // The id param may contain the hcloud URL directly after some base64 prefix
+    // e.g. "BASE64_STUFFhttps://hcloud.shop/..."
+    const inId = /(https?:\/\/hcloud\.shop\/[^\s"'<>]+)/.exec(idVal);
+    if (inId) return inId[1];
+
+    // Pattern 3: the id= param itself is base64 — decode and look for hcloud
+    try {
+      const decoded = Buffer.from(idVal, 'base64').toString('utf8');
+      const inDecoded = /(https?:\/\/hcloud\.shop\/[^\s"'<>]+)/.exec(decoded);
+      if (inDecoded) return inDecoded[1];
+    } catch {}
+
+    // Pattern 4: hcloud redirect.php?url=BASE64 — decode the nested base64
+    const redirectMatch = /hcloud\.shop\/redirect\.php\?url=([A-Za-z0-9+/=%-]+)/.exec(url);
+    if (redirectMatch) {
+      try {
+        const inner = decodeURIComponent(redirectMatch[1]);
+        const decoded = Buffer.from(inner, 'base64').toString('utf8');
+        // decoded is now the actual hcloud page URL
+        const hcloudUrl = 'https://hcloud.shop/redirect.php?url=' + encodeURIComponent(
+          Buffer.from(decoded).toString('base64')
+        );
+        return 'https://hcloud.shop/redirect.php?url=' + redirectMatch[1];
+      } catch {}
+    }
+
+    return null;
+  } catch (e) {
+    console.log(`[extractEmbeddedHcloud] error: ${e}`);
+    return null;
+  }
+}
+
+// ─── Decode hcloud double-base64 chain → final CDN URL ───────────────────────
+//
+//  Chain:
+//   hcloud.shop/redirect.php?url=B64_1
+//     → decode B64_1 → hcloud.shop/direct/index.php?url=B64_2
+//       → decode B64_2 → FINAL CDN URL (workers.dev / drive / etc.)
+//
+//  This is done purely in memory — zero HTTP requests.
+
+function decodeHcloudChain(hcloudUrl) {
+  try {
+    const u = new URL(hcloudUrl);
+    const urlParam = u.searchParams.get('url');
+    if (!urlParam) return null;
+
+    // First decode
+    const decoded1 = Buffer.from(urlParam, 'base64').toString('utf8');
+    console.log(`[hcloud/decode] step1: ${decoded1.slice(0, 80)}`);
+
+    // If it's another hcloud URL, decode again
+    if (decoded1.includes('hcloud.shop')) {
+      const u2 = new URL(decoded1);
+      const urlParam2 = u2.searchParams.get('url');
+      if (urlParam2) {
+        const decoded2 = Buffer.from(urlParam2, 'base64').toString('utf8');
+        console.log(`[hcloud/decode] step2 (final): ${decoded2.slice(0, 80)}`);
+        return decoded2;
+      }
+      return decoded1;
+    }
+
+    return decoded1;
+  } catch (e) {
+    console.log(`[hcloud/decode] error: ${e}`);
+    return null;
+  }
+}
 
 async function bypassHshareMulti(url) {
   console.log(`[hshare/multi] ${url}`);
 
   if (url.includes('/file.php') && url.includes('id=') && url.includes('key=')) {
-    // ── file.php: race direct fetch vs proxy simultaneously ────────────────
-    let html = null;
 
+    // ── Ultra-fast path: hcloud URL embedded in the URL string ───────────────
+    // The id= param often contains the hcloud link raw (no fetch needed at all)
+    const embeddedHcloud = extractEmbeddedHcloud(url);
+    if (embeddedHcloud) {
+      console.log(`[hshare/file.php] embedded hcloud: ${embeddedHcloud}`);
+      return bypassHcloud(embeddedHcloud);
+    }
+
+    // ── Normal path: fetch page, find hcloud link ─────────────────────────────
+    let html = null;
     const directFetch = fetch(url, {
       headers: bH({ Referer: 'https://hshare.ink/' }),
       redirect: 'follow',
@@ -320,37 +370,93 @@ async function bypassHshareMulti(url) {
       return [{ server: 'HShare', link: url }];
     }
 
-    // Find hcloud.shop link and bypass it
-    const hcloudM = /href=["'](https?:\/\/[^"']*hcloud[^"']+)["']/i.exec(html);
+    // hcloud link in href
+    const hcloudM = /(https?:\/\/[^\s"'<>]*hcloud[^\s"'<>]*)/i.exec(html);
     if (hcloudM) {
       console.log(`[hshare/file.php] → hcloud: ${hcloudM[1]}`);
       return bypassHcloud(hcloudM[1]);
     }
 
-    // Scan all links
+    // Scan anchors
     const streams = [];
     for (const el of parseLinks(html)) {
-      if (!el.href.startsWith('http') || el.href.includes('hshare') || el.href.startsWith('javascript')) continue;
+      if (!el.href.startsWith('http') || el.href.includes('hshare')) continue;
       if (el.href.includes('hcloud')) {
-        const servers = await bypassHcloud(el.href);
-        streams.push(...servers);
+        streams.push(...(await bypassHcloud(el.href)));
       } else {
         streams.push({ server: el.text || 'HShare', link: el.href });
       }
     }
-
-    // Last resort: extractFinalFromHtml
     if (!streams.length) {
       const direct = extractFinalFromHtml(html);
       if (direct) streams.push({ server: 'HShare', link: direct });
     }
-
     return streams.length ? streams : [{ server: 'HShare', link: url }];
   }
 
-  // redirect.php path — single URL result from token bypass
+  // redirect.php — single URL from token bypass
   const finalUrl = await bypassHshare(url);
   return [{ server: 'HShare', link: finalUrl }];
+}
+
+async function bypassHcloud(url) {
+  console.log(`[hcloud] ${url}`);
+  try {
+    // Fast path: decode the base64 chain without any HTTP request
+    if (url.includes('hcloud.shop') && url.includes('url=')) {
+      const finalUrl = decodeHcloudChain(url);
+      if (finalUrl && finalUrl.startsWith('http') && !finalUrl.includes('hcloud.shop')) {
+        console.log(`[hcloud] decoded (no fetch): ${finalUrl.slice(0, 80)}`);
+        return [{ server: 'HCloud', link: finalUrl }];
+      }
+      // decoded is another hcloud page — fetch it for server buttons
+      if (finalUrl && finalUrl.includes('hcloud.shop')) {
+        return fetchHcloudPage(finalUrl);
+      }
+    }
+    return fetchHcloudPage(url);
+  } catch (e) {
+    console.log(`[hcloud] error: ${e}`);
+    return [{ server: 'HCloud', link: url }];
+  }
+}
+
+async function fetchHcloudPage(url) {
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 6000);
+  let html;
+  try {
+    const r = await fetch(url, {
+      headers: bH({ Referer: 'https://hshare.ink/' }),
+      redirect: 'follow',
+      signal: ac.signal,
+      agent: httpsAgent,
+    });
+    html = await r.text();
+  } catch {
+    try { ({ text: html } = await scrapeHtml(url, 'https://hshare.ink/')); }
+    catch { return [{ server: 'HCloud', link: url }]; }
+  }
+
+  const servers = [];
+  for (let i = 1; i <= 10; i++) {
+    const m = new RegExp(
+      `id=["']download-btn${i}["'][^>]*href=["']([^"']+)["']|href=["']([^"']+)["'][^>]*id=["']download-btn${i}["']`, 'i'
+    ).exec(html);
+    if (m) servers.push({ server: `Server ${i}`, link: m[1] || m[2] });
+  }
+  if (!servers.length) {
+    for (const el of parseLinks(html)) {
+      if (/server\s*\d+/i.test(el.text) && el.href.startsWith('http'))
+        servers.push({ server: el.text.trim(), link: el.href });
+    }
+  }
+  if (!servers.length) {
+    const direct = extractFinalFromHtml(html);
+    if (direct) servers.push({ server: 'HCloud', link: direct });
+  }
+  console.log(`[hcloud/page] ${servers.length} server(s)`);
+  return servers.length ? servers : [{ server: 'HCloud', link: url }];
 }
 
 function extractFinalFromHtml(html) {
