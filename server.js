@@ -296,38 +296,23 @@ function extractEmbeddedHcloud(url) {
   }
 }
 
-// ─── Decode hcloud double-base64 chain → final CDN URL ───────────────────────
+// ─── Decode hcloud base64 chain ───────────────────────────────────────────────
 //
-//  Chain:
-//   hcloud.shop/redirect.php?url=B64_1
-//     → decode B64_1 → hcloud.shop/direct/index.php?url=B64_2
-//       → decode B64_2 → FINAL CDN URL (workers.dev / drive / etc.)
+//  redirect.php?url=B64_1
+//    → decode B64_1 → direct/index.php?url=B64_2   ← page WITH server buttons
 //
-//  This is done purely in memory — zero HTTP requests.
+//  We decode only ONE level to get the hcloud page URL.
+//  fetchHcloudPage() then fetches it and scrapes all server buttons.
 
 function decodeHcloudChain(hcloudUrl) {
   try {
     const u = new URL(hcloudUrl);
     const urlParam = u.searchParams.get('url');
     if (!urlParam) return null;
-
-    // First decode
-    const decoded1 = Buffer.from(urlParam, 'base64').toString('utf8');
-    console.log(`[hcloud/decode] step1: ${decoded1.slice(0, 80)}`);
-
-    // If it's another hcloud URL, decode again
-    if (decoded1.includes('hcloud.shop')) {
-      const u2 = new URL(decoded1);
-      const urlParam2 = u2.searchParams.get('url');
-      if (urlParam2) {
-        const decoded2 = Buffer.from(urlParam2, 'base64').toString('utf8');
-        console.log(`[hcloud/decode] step2 (final): ${decoded2.slice(0, 80)}`);
-        return decoded2;
-      }
-      return decoded1;
-    }
-
-    return decoded1;
+    // One decode → gives us hcloud.shop/direct/index.php?url=... (the page with buttons)
+    const decoded = Buffer.from(urlParam, 'base64').toString('utf8');
+    console.log(`[hcloud/decode] → ${decoded.slice(0, 100)}`);
+    return decoded;
   } catch (e) {
     console.log(`[hcloud/decode] error: ${e}`);
     return null;
@@ -402,17 +387,10 @@ async function bypassHshareMulti(url) {
 async function bypassHcloud(url) {
   console.log(`[hcloud] ${url}`);
   try {
-    // Fast path: decode the base64 chain without any HTTP request
+    // redirect.php?url=BASE64 → decode one level → get direct/index.php page → fetch it
     if (url.includes('hcloud.shop') && url.includes('url=')) {
-      const finalUrl = decodeHcloudChain(url);
-      if (finalUrl && finalUrl.startsWith('http') && !finalUrl.includes('hcloud.shop')) {
-        console.log(`[hcloud] decoded (no fetch): ${finalUrl.slice(0, 80)}`);
-        return [{ server: 'HCloud', link: finalUrl }];
-      }
-      // decoded is another hcloud page — fetch it for server buttons
-      if (finalUrl && finalUrl.includes('hcloud.shop')) {
-        return fetchHcloudPage(finalUrl);
-      }
+      const pageUrl = decodeHcloudChain(url);
+      if (pageUrl) return fetchHcloudPage(pageUrl);
     }
     return fetchHcloudPage(url);
   } catch (e) {
@@ -422,10 +400,13 @@ async function bypassHcloud(url) {
 }
 
 async function fetchHcloudPage(url) {
-  const ac = new AbortController();
-  setTimeout(() => ac.abort(), 6000);
-  let html;
+  console.log(`[hcloud/page] fetching: ${url.slice(0, 100)}`);
+
+  // Race direct fetch vs proxy — hcloud.shop is usually not CF-blocked
+  let html = '';
   try {
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 6000);
     const r = await fetch(url, {
       headers: bH({ Referer: 'https://hshare.ink/' }),
       redirect: 'follow',
@@ -433,29 +414,64 @@ async function fetchHcloudPage(url) {
       agent: httpsAgent,
     });
     html = await r.text();
-  } catch {
-    try { ({ text: html } = await scrapeHtml(url, 'https://hshare.ink/')); }
-    catch { return [{ server: 'HCloud', link: url }]; }
+    console.log(`[hcloud/page] direct OK len=${html.length}`);
+  } catch (e) {
+    console.log(`[hcloud/page] direct failed: ${e} — trying proxy`);
+    try {
+      ({ text: html } = await scrapeHtml(url, 'https://hshare.ink/'));
+    } catch {
+      return [{ server: 'HCloud', link: url }];
+    }
   }
 
   const servers = [];
+  const seen = new Set();
+
+  const add = (server, link) => {
+    if (!link || !link.startsWith('http') || seen.has(link)) return;
+    seen.add(link);
+    servers.push({ server, link });
+  };
+
+  // ── Pattern 1: id="download-btn1" ... id="download-btn10" ────────────────
   for (let i = 1; i <= 10; i++) {
     const m = new RegExp(
       `id=["']download-btn${i}["'][^>]*href=["']([^"']+)["']|href=["']([^"']+)["'][^>]*id=["']download-btn${i}["']`, 'i'
     ).exec(html);
-    if (m) servers.push({ server: `Server ${i}`, link: m[1] || m[2] });
+    if (m) add(`Server ${i}`, (m[1] || m[2]).trim());
   }
-  if (!servers.length) {
-    for (const el of parseLinks(html)) {
-      if (/server\s*\d+/i.test(el.text) && el.href.startsWith('http'))
-        servers.push({ server: el.text.trim(), link: el.href });
+
+  // ── Pattern 2: All <a> buttons with server-like text ─────────────────────
+  for (const el of parseLinks(html)) {
+    if (!el.href.startsWith('http')) continue;
+    const txt = el.text.trim();
+    if (/server\s*\d*/i.test(txt) || /download/i.test(txt) || /link\s*\d*/i.test(txt)) {
+      add(txt || `Server`, el.href);
     }
   }
+
+  // ── Pattern 3: data-url or data-href attributes ───────────────────────────
+  const dataRe = /data-(?:url|href|src)=["'](https?:\/\/[^"']+)["']/gi;
+  let dm;
+  while ((dm = dataRe.exec(html)) !== null) add('HCloud', dm[1]);
+
+  // ── Pattern 4: workers.dev / r2.dev / CDN links in JS ────────────────────
+  const cdnRe = /(https?:\/\/[^\s"'<>\\]+\.(?:workers\.dev|r2\.dev|cloudfront\.net|b-cdn\.net|bunnycdn\.com)[^\s"'<>\\]*)/g;
+  let cm;
+  while ((cm = cdnRe.exec(html)) !== null) add('HCloud CDN', cm[1].split('\\')[0]);
+
+  // ── Pattern 5: btn-success / btn-primary / btn-warning buttons ────────────
   if (!servers.length) {
-    const direct = extractFinalFromHtml(html);
-    if (direct) servers.push({ server: 'HCloud', link: direct });
+    for (const el of parseLinks(html)) {
+      if (!el.href.startsWith('http')) continue;
+      if (el.classes.includes('btn-success') || el.classes.includes('btn-primary') ||
+          el.classes.includes('btn-warning') || el.classes.includes('btn-info')) {
+        add(el.text.trim() || 'HCloud', el.href);
+      }
+    }
   }
-  console.log(`[hcloud/page] ${servers.length} server(s)`);
+
+  console.log(`[hcloud/page] ${servers.length} server(s) found`);
   return servers.length ? servers : [{ server: 'HCloud', link: url }];
 }
 
