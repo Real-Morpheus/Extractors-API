@@ -277,85 +277,146 @@ function decodeHcloudDirect(directUrl) {
 }
 
 /**
+ * Scrape all download-btnN anchors from an hcloud HTML string.
+ * Handles both attribute orders:
+ *   <a href="..." class="button" id="download-btn2" onclick="...">Server 2</a>
+ *   <a id="download-btn2" href="..." ...>Server 2</a>
+ */
+function scrapeHcloudButtons(html) {
+  const results = [];
+  const seen = new Set();
+
+  // Strategy A: targeted regex — find every tag that contains id="download-btnN"
+  // We widen the match to capture the full opening tag even if it has onclick with parens
+  const tagRe = /<a\s([^<]*?id=["']download-btn(\d+)["'][^<]*?)>/gi;
+  let tm;
+  while ((tm = tagRe.exec(html)) !== null) {
+    const attrs = tm[1];
+    const num   = tm[2];
+    const hrefM = /\bhref=["']([^"']+)["']/i.exec(attrs);
+    if (!hrefM) continue;
+    const link = hrefM[1].trim();
+    if (!link.startsWith('http') || link.includes('hcloud.shop') || seen.has(link)) continue;
+    seen.add(link);
+    results.push({ num: parseInt(num, 10), server: `Server ${num}`, link });
+  }
+
+  // Strategy B: if tagRe caught nothing (e.g. attributes wrap lines), use split approach
+  if (!results.length) {
+    // Split on id="download-btn and work outward
+    const parts = html.split(/id=["']download-btn/i);
+    for (let i = 1; i < parts.length; i++) {
+      const numM = /^(\d+)["']/.exec(parts[i]);
+      if (!numM) continue;
+      const num = numM[1];
+      // Look backward in parts[i-1] for the nearest href=
+      const before = parts[i - 1];
+      // Find last href= before this id=
+      const hrefM = /href=["']([^"']+)["'][^<]*$/.exec(before);
+      if (hrefM) {
+        const link = hrefM[1].trim();
+        if (link.startsWith('http') && !link.includes('hcloud.shop') && !seen.has(link)) {
+          seen.add(link);
+          results.push({ num: parseInt(num, 10), server: `Server ${num}`, link });
+          continue;
+        }
+      }
+      // Or look forward in parts[i] for href=
+      const hrefFwd = /href=["']([^"']+)["']/.exec(parts[i]);
+      if (hrefFwd) {
+        const link = hrefFwd[1].trim();
+        if (link.startsWith('http') && !link.includes('hcloud.shop') && !seen.has(link)) {
+          seen.add(link);
+          results.push({ num: parseInt(num, 10), server: `Server ${num}`, link });
+        }
+      }
+    }
+  }
+
+  // Sort by server number so output is Server 1, 2, 3, 4…
+  results.sort((a, b) => a.num - b.num);
+  return results.map(({ server, link }) => ({ server, link, type: 'mkv' }));
+}
+
+/**
  * Fetch hcloud direct/index.php page and scrape all download-btn# server links.
  * Returns array of { server, link, type }
  */
 async function fetchHcloudDirectPage(directUrl) {
   console.log(`[hcloud/direct-page] ${directUrl.slice(0, 120)}`);
-  const servers = [];
   const seen = new Set();
+  const servers = [];
 
   const add = (serverName, link) => {
     if (!link || !link.startsWith('http') || seen.has(link)) return;
     seen.add(link);
     servers.push({ server: serverName, link, type: 'mkv' });
-    console.log(`[hcloud/direct-page] added: ${serverName} → ${link.slice(0, 80)}`);
+    console.log(`[hcloud/direct-page] +${serverName}: ${link.slice(0, 80)}`);
   };
 
-  // ── Instant: decode url= param directly — gives us the base CDN URL ────────
+  // ── Instant decode: url= param → actual CDN URL (zero network, always works) ─
   const instantUrl = decodeHcloudDirect(directUrl);
   if (instantUrl) add('Server 1', instantUrl);
 
-  // ── Fetch the page to get all server buttons ────────────────────────────────
+  // ── Fetch page — try direct + all proxies in parallel, take fastest ──────────
   let html = '';
   try {
-    // Try direct fetch first (hcloud.shop is in CF_PROTECTED so raceProxies fires)
-    html = await raceProxies(directUrl, 'https://hshare.ink/');
+    const enc = encodeURIComponent(directUrl);
+    const hdrs = bH({ Referer: 'https://hshare.ink/' });
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 10000);
+
+    // Fire direct fetch AND proxy race simultaneously — winner takes all
+    const directFetch = fetch(directUrl, {
+      headers: hdrs,
+      redirect: 'follow',
+      signal: ac.signal,
+      agent: httpsAgent,
+    }).then(async r => {
+      if (!r.ok) throw new Error(`direct ${r.status}`);
+      const t = await r.text();
+      if (t.length < 200) throw new Error('direct too short');
+      return t;
+    });
+
+    const proxyFetch = raceProxies(directUrl, 'https://hshare.ink/');
+
+    html = await Promise.any([directFetch, proxyFetch]);
+    clearTimeout(timer);
     console.log(`[hcloud/direct-page] fetched len=${html.length}`);
   } catch (e) {
-    console.log(`[hcloud/direct-page] fetch failed: ${e.message}`);
-    // Return whatever instant decode gave us
+    console.log(`[hcloud/direct-page] all fetches failed: ${e.message}`);
     return servers.length ? servers : [{ server: 'HCloud', link: directUrl, type: 'mkv' }];
   }
 
-  // Pattern 1: id="download-btn1" … id="download-btnN"
-  // The anchor has both id= and href= attributes; order varies
-  const btnRe = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
-  let bm;
-  while ((bm = btnRe.exec(html)) !== null) {
-    const attrs = bm[1];
-    const idM   = /\bid=["'](download-btn\d+)["']/i.exec(attrs);
-    const hrefM = /\bhref=["']([^"']+)["']/i.exec(attrs);
-    if (idM && hrefM) {
-      const num = idM[1].replace('download-btn', '');
-      const link = hrefM[1].trim();
-      if (link.startsWith('http') && !link.includes('hcloud.shop')) {
-        add(`Server ${num}`, link);
-      }
-    }
-  }
+  // ── Pattern 1: scrape id="download-btnN" anchors (primary) ──────────────────
+  const btnResults = scrapeHcloudButtons(html);
+  for (const s of btnResults) add(s.server, s.link);
 
-  // Pattern 2: class="button" anchors (the page uses class="button" not btn-*)
+  // ── Pattern 2: class="button" anchors with "Server N" text (fallback) ────────
   if (servers.length <= 1) {
     for (const el of parseLinks(html)) {
       if (!el.href.startsWith('http') || el.href.includes('hcloud.shop')) continue;
-      if (el.classes.includes('button') || /server\s*\d*/i.test(el.text)) {
+      if (el.classes.split(/\s+/).includes('button') || /^server\s*\d*$/i.test(el.text.trim())) {
         add(el.text.trim() || 'Server', el.href);
       }
     }
   }
 
-  // Pattern 3: any workers.dev CDN URLs directly in HTML
-  const workerRe = /(https?:\/\/[^\s"'<>\\]+\.workers\.dev\/[^\s"'<>\\]*)/g;
-  let wm;
-  while ((wm = workerRe.exec(html)) !== null) {
-    const link = wm[1].split('\\')[0].split('"')[0];
-    if (!seen.has(link)) add(`CDN Server ${servers.length + 1}`, link);
-  }
-
-  // Pattern 4: decode every url= base64 param found in page
-  const urlParamRe = /[?&]url=([A-Za-z0-9+/=%-]{20,})/g;
-  let pm;
-  while ((pm = urlParamRe.exec(html)) !== null) {
-    try {
-      const dec = Buffer.from(decodeURIComponent(pm[1]), 'base64').toString('utf8');
-      if (dec.startsWith('http') && !dec.includes('hcloud.shop')) {
-        add(`Mirror ${servers.length + 1}`, dec);
+  // ── Pattern 3: any *.workers.dev URLs in raw HTML (last resort) ─────────────
+  if (servers.length <= 1) {
+    const workerRe = /(https?:\/\/[^\s"'<>\\]+\.workers\.dev\/[^\s"'<>\\]*)/g;
+    let wm;
+    let idx = 2;
+    while ((wm = workerRe.exec(html)) !== null) {
+      const link = wm[1].replace(/['"<>\\]/g, '');
+      if (!seen.has(link)) {
+        add(`Server ${idx++}`, link);
       }
-    } catch {}
+    }
   }
 
-  console.log(`[hcloud/direct-page] total servers: ${servers.length}`);
+  console.log(`[hcloud/direct-page] total: ${servers.length} server(s)`);
   return servers.length ? servers : [{ server: 'HCloud', link: directUrl, type: 'mkv' }];
 }
 
@@ -408,24 +469,11 @@ async function bypassHcloud(url) {
 //     → pass to bypassHcloud() → array of { server, link }
 
 /**
- * Fetch hshare file.php page (or redirect.php token-resolved page)
- * and extract all download server links.
+ * Core logic: given HTML of an hshare download page (file.php or POST response),
+ * extract all server links. Used by both bypassHshareFilePage and redirect POST handler.
  * Returns array of { server, link, type }
  */
-async function bypassHshareFilePage(url) {
-  console.log(`[hshare/file-page] ${url}`);
-
-  let html = '';
-  try {
-    // hshare.ink is in CF_PROTECTED → raceProxies fires automatically via scrapeHtml
-    const result = await scrapeHtml(url, 'https://hshare.ink/');
-    html = result.text;
-    console.log(`[hshare/file-page] fetched len=${html.length}`);
-  } catch (e) {
-    console.log(`[hshare/file-page] fetch failed: ${e.message}`);
-    return [{ server: 'HShare', link: url, type: 'mkv' }];
-  }
-
+async function parseHshareDownloadPage(html, pageUrl) {
   const streams = [];
   const futs = [];
 
@@ -434,25 +482,23 @@ async function bypassHshareFilePage(url) {
     const text = el.text.trim();
 
     if (!href || !href.startsWith('http')) continue;
+    if (href.includes('hshare.ink') || href.startsWith('javascript') || href.startsWith('#')) continue;
 
-    // HPage button → hcloud.shop/redirect.php?url=...
+    // HPage button → hcloud full chain
     if (href.includes('hcloud.shop')) {
-      console.log(`[hshare/file-page] found hcloud link: ${href.slice(0, 100)}`);
-      futs.push(
-        bypassHcloud(href).then(ss => ss.forEach(s => streams.push({ ...s, type: 'mkv' })))
-      );
+      console.log(`[hshare/parse] hcloud: ${href.slice(0, 80)}`);
+      futs.push(bypassHcloud(href).then(ss => ss.forEach(s => streams.push({ ...s, type: 'mkv' }))));
       continue;
     }
 
-    // GDirect button
-    if (href.includes('gdirect') || (text.toLowerCase().includes('gdirect') && href.includes('redirect.php'))) {
-      futs.push(
-        gdirectExtract(href).then(ss => ss.forEach(s => streams.push({ ...s, type: 'mkv' })))
-      );
+    // GDirect
+    if (href.includes('gdirect.sbs') || href.includes('gdirect.in') ||
+        (text.toLowerCase() === 'gdirect' && href.includes('redirect.php'))) {
+      futs.push(gdirectExtract(href).then(ss => ss.forEach(s => streams.push({ ...s, type: 'mkv' }))));
       continue;
     }
 
-    // GDTOT button
+    // GDTOT
     if (href.includes('gdtot')) {
       streams.push({ server: 'GDTOT', link: href, type: 'mkv' });
       continue;
@@ -464,10 +510,7 @@ async function bypassHshareFilePage(url) {
       continue;
     }
 
-    // Skip hshare self-links, JS, etc.
-    if (href.includes('hshare.ink') || href.startsWith('javascript') || href.startsWith('#')) continue;
-
-    // Any other external link with a download-flavored class/text
+    // Any other download-flavoured link
     const isDownload =
       el.classes.includes('btn-success') || el.classes.includes('btn-danger') ||
       el.classes.includes('btn-primary') || el.classes.includes('btn-info') ||
@@ -479,6 +522,28 @@ async function bypassHshareFilePage(url) {
   }
 
   await Promise.all(futs);
+  return streams;
+}
+
+/**
+ * Fetch hshare file.php page (or redirect.php token-resolved page)
+ * and extract all download server links.
+ * Returns array of { server, link, type }
+ */
+async function bypassHshareFilePage(url) {
+  console.log(`[hshare/file-page] ${url}`);
+
+  let html = '';
+  try {
+    const result = await scrapeHtml(url, 'https://hshare.ink/');
+    html = result.text;
+    console.log(`[hshare/file-page] fetched len=${html.length}`);
+  } catch (e) {
+    console.log(`[hshare/file-page] fetch failed: ${e.message}`);
+    return [{ server: 'HShare', link: url, type: 'mkv' }];
+  }
+
+  const streams = await parseHshareDownloadPage(html, url);
   console.log(`[hshare/file-page] total streams: ${streams.length}`);
   return streams.length ? streams : [{ server: 'HShare', link: url, type: 'mkv' }];
 }
@@ -528,30 +593,39 @@ async function bypassHshareRedirect(url) {
         redirect: 'follow',
       });
       const resultHtml = await r.text();
+      console.log(`[hshare/redirect] POST response len=${resultHtml.length} finalUrl=${r.url}`);
 
-      // POST may redirect to file.php — check Location header via r.url
-      if (r.url && r.url !== action && r.url.includes('hshare.ink')) {
-        console.log(`[hshare/redirect] POST redirected to: ${r.url}`);
-        return bypassHshareFilePage(r.url);
+      // Case 1: POST caused a real URL redirect
+      if (r.url && r.url !== action) {
+        if (r.url.includes('hshare.ink')) {
+          console.log(`[hshare/redirect] POST → hshare page: ${r.url}`);
+          return bypassHshareFilePage(r.url);
+        }
+        if (r.url.includes('hcloud.shop')) {
+          console.log(`[hshare/redirect] POST → hcloud: ${r.url}`);
+          return bypassHcloud(r.url);
+        }
       }
 
-      // POST response may contain the file.php URL or direct links
+      // Case 2: POST response body IS the download page (most common)
+      // It has the GDirect/HPage/GDTOT btn-group — parse it directly
+      if (resultHtml.includes('hcloud.shop') || resultHtml.includes('btn-group') || resultHtml.includes('btn btn-')) {
+        console.log(`[hshare/redirect] POST body is download page — parsing inline`);
+        const inlineStreams = await parseHshareDownloadPage(resultHtml, r.url || action);
+        if (inlineStreams.length) return inlineStreams;
+      }
+
+      // Case 3: file.php URL embedded in POST response
       const filephpM = /(https?:\/\/hshare\.ink\/file\.php[^"'<>\s]+)/.exec(resultHtml);
       if (filephpM) {
-        console.log(`[hshare/redirect] found file.php in POST response`);
+        console.log(`[hshare/redirect] file.php URL in POST body`);
         return bypassHshareFilePage(filephpM[1]);
       }
 
-      // POST response may have hcloud link directly
-      const hcloudM = /(https?:\/\/hcloud\.shop\/[^"'<>\s]+)/.exec(resultHtml);
-      if (hcloudM) {
-        console.log(`[hshare/redirect] found hcloud in POST response`);
-        return bypassHcloud(hcloudM[1]);
-      }
-
-      // Check reurl var or direct download link
+      // Case 4: direct final link
       const final = extractFinalFromHtml(resultHtml);
       if (final && !final.includes('hshare')) {
+        console.log(`[hshare/redirect] POST direct link: ${final}`);
         return [{ server: 'HShare', link: final, type: 'mkv' }];
       }
     } catch (e) {
